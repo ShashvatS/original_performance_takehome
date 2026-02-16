@@ -20,7 +20,6 @@ Optimizations applied:
     - Const-zero treated as pseudo-op (scratch is zero-initialized)
     - Flow add_imm fallback when load slots are full
     - Count-based critical-path priority with periodic recomputation
-    - Memory pressure heuristic (allocation penalty above 90%)
 """
 
 from __future__ import annotations
@@ -64,7 +63,8 @@ LATE_SCHEDULE_THRESHOLD = 300
 
 # Priority calculation scales
 CRITICAL_PATH_SCALE = 100.0
-MAX_CROSS_ENGINE_BONUS = 3
+# Cross engine bonus currently has no impact.
+MAX_CROSS_ENGINE_BONUS = 0
 EMIT_ORDER_SCALE = 10.0
 
 # ══════════════════════════════════════════════════════════════════════
