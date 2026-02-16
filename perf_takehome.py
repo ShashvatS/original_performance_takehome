@@ -52,6 +52,13 @@ from problem import (
 VIRTUAL_BASE: int = 100_000
 ENABLE_DEPTH_3_VSELECT: bool = True
 ENABLE_DEPTH_4_VSELECT: bool = True
+
+# When True, reverse bit order in vselect tree: use earliest bit (bit0)
+# for leaf multiply_add, allowing tree computation to start before later
+# bits are ready. Requires bit-reversal permutation of source vectors.
+REVERSE_TREE_BIT_ORDER_DEPTH_2: bool = True
+REVERSE_TREE_BIT_ORDER_DEPTH_3: bool = False
+REVERSE_TREE_BIT_ORDER_DEPTH_4: bool = False
 MAX_CONCURRENT_GROUPS: int = 20
 BASELINE_CYCLES: int = 147734
 PRIORITY_RECOMPUTE_INTERVAL: int = 5
@@ -95,6 +102,24 @@ def use_vselect_at_depth_3(g: int) -> bool:
 def use_vselect_at_depth_4(g: int) -> bool:
     """Which groups use vselect at depth 4 (vs scatter loads)."""
     return g % 3 == 0 and use_vselect_at_depth_3(g)
+
+
+def _bit_reverse_permute(sources: list, n_bits: int) -> list:
+    """Apply bit-reversal permutation to a list of 2^n_bits elements.
+
+    Used to reorder tree node vectors so that reversing the bit consumption
+    order in the vselect tree still selects the correct tree node.
+    """
+    n = 1 << n_bits
+    assert len(sources) == n
+    result = [None] * n
+    for i in range(n):
+        rev = 0
+        for b in range(n_bits):
+            if i & (1 << b):
+                rev |= 1 << (n_bits - 1 - b)
+        result[i] = sources[rev]
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1177,8 +1202,11 @@ class KernelBuilder:
         tree_d1_right_vec = self.emit(
             "tree_d1_right_vec", "valu", ("vbroadcast", tree_vals_lo.with_offset(2)))
 
+        d2_sources = [(tree_vals_lo, 3 + i) for i in range(4)]
+        if REVERSE_TREE_BIT_ORDER_DEPTH_2:
+            d2_sources = _bit_reverse_permute(d2_sources, 2)
         tree_d2_vec, tree_d2_diff = self._emit_broadcast_and_diff(
-            "tree_d2", [(tree_vals_lo, 3 + i) for i in range(4)])
+            "tree_d2", d2_sources)
 
         tree_d3_vec: dict[int, Ref] = {}
         tree_d3_diff: dict[int, Ref] = {}
@@ -1186,6 +1214,8 @@ class KernelBuilder:
             d3_sources = (
                 [(tree_vals_lo, 7)]
                 + [(tree_vals_hi, i) for i in range(7)])
+            if REVERSE_TREE_BIT_ORDER_DEPTH_3:
+                d3_sources = _bit_reverse_permute(d3_sources, 3)
             tree_d3_vec, tree_d3_diff = self._emit_broadcast_and_diff("tree_d3", d3_sources)
 
         tree_d4_vec: dict[int, Ref] = {}
@@ -1200,6 +1230,8 @@ class KernelBuilder:
             d4_sources = (
                 [(d4_lo, i) for i in range(8)]
                 + [(d4_hi, i) for i in range(8)])
+            if REVERSE_TREE_BIT_ORDER_DEPTH_4:
+                d4_sources = _bit_reverse_permute(d4_sources, 4)
             tree_d4_vec, tree_d4_diff = self._emit_broadcast_and_diff("tree_d4", d4_sources)
 
         hash_const1_vec: dict[int, Ref] = {}
@@ -1245,11 +1277,13 @@ class KernelBuilder:
         vec: dict[int, Ref],
         reduce_bits: list[Ref],
     ) -> Ref:
-        """Build multiply_add leaves, then binary vselect reduction."""
-        # This tree is currently in the wrong order.
-        # Really, we should use vselect using the latest bit, allowing us
-        # to compute the earlier stages of the tree using the known bits.
-        # For some reason, this takes longer even though it should be strictly better.
+        """Build multiply_add leaves, then binary vselect reduction.
+
+        Bit order is controlled by REVERSE_TREE_BIT_ORDER_DEPTH_* toggles.
+        When reversed, leaf_bit is the earliest bit (bit0), allowing tree
+        computation to start before later bits are ready. This requires
+        bit-reversal permutation of the source vectors in _emit_setup.
+        """
         label = f"d{depth}"
         n_leaves = len(diff)
 
@@ -1291,23 +1325,35 @@ class KernelBuilder:
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 2:
+            if REVERSE_TREE_BIT_ORDER_DEPTH_2:
+                leaf_bit, reduce_bit = bit0, bit1
+            else:
+                leaf_bit, reduce_bit = bit1, bit0
             p0 = self.emit(
                 f"{prefix}_d2_pair0", "valu",
-                ("multiply_add", bit1, s.tree_d2_diff[0], s.tree_d2_vec[0]))
+                ("multiply_add", leaf_bit, s.tree_d2_diff[0], s.tree_d2_vec[0]))
             p1 = self.emit(
                 f"{prefix}_d2_pair1", "valu",
-                ("multiply_add", bit1, s.tree_d2_diff[1], s.tree_d2_vec[2]))
-            nv = self.emit(f"{prefix}_d2_select", "flow", ("vselect", bit0, p1, p0))
+                ("multiply_add", leaf_bit, s.tree_d2_diff[1], s.tree_d2_vec[2]))
+            nv = self.emit(f"{prefix}_d2_select", "flow", ("vselect", reduce_bit, p1, p0))
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g):
-            nv = self._emit_vselect_tree(
-                prefix, 3, bit2, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit0])
+            if REVERSE_TREE_BIT_ORDER_DEPTH_3:
+                nv = self._emit_vselect_tree(
+                    prefix, 3, bit0, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit2])
+            else:
+                nv = self._emit_vselect_tree(
+                    prefix, 3, bit2, s.tree_d3_diff, s.tree_d3_vec, [bit1, bit0])
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 4 and ENABLE_DEPTH_4_VSELECT and use_vselect_at_depth_4(g):
-            nv = self._emit_vselect_tree(
-                prefix, 4, bit3, s.tree_d4_diff, s.tree_d4_vec, [bit2, bit1, bit0])
+            if REVERSE_TREE_BIT_ORDER_DEPTH_4:
+                nv = self._emit_vselect_tree(
+                    prefix, 4, bit0, s.tree_d4_diff, s.tree_d4_vec, [bit1, bit2, bit3])
+            else:
+                nv = self._emit_vselect_tree(
+                    prefix, 4, bit3, s.tree_d4_diff, s.tree_d4_vec, [bit2, bit1, bit0])
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         scatter = self.alloc_vec(f"{prefix}_scatter", deps=[ts.index, values])
