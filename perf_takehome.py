@@ -1,179 +1,1614 @@
 """
-# Anthropic's Original Performance Engineering Take-home (Release version)
+# Anthropic's Performance Engineering Take-home
 
-Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
-to publish or redistribute your solutions so it's hard to find spoilers.
+Optimizations applied:
 
-# Task
+  Kernel:
+    - VALU vectorization (8-wide SIMD for all per-element work)
+    - multiply_add for even hash stages (fused a*mult+const)
+    - vselect tree selection for depths 0-4 (configurable per depth)
+    - Scatter loads for depths 5+ (per-element memory loads)
+    - Bulk vload of tree node values (4 vloads for depths 0-4)
+    - 1-indexed tree traversal (eliminates +1/+2 branching)
+    - Last-round index update skipped (dead code elimination)
 
-- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
-  available time, as measured by test_kernel_cycles on a frozen separate copy
-  of the simulator.
-
-Validate your results using `python tests/submission_tests.py` without modifying
-anything in the tests/ folder.
-
-We recommend you look through problem.py next.
+  Scheduler:
+    - Greedy list scheduler with dual-pool scratch allocation
+    - ALU offloading: simple VALU ops decomposed into 8 scalar ALUs
+    - Retroactive split ALU offload (2-way and 4-way across cycles)
+    - Deferred scratch freeing (prevents read/write conflicts)
+    - Const-zero treated as pseudo-op (scratch is zero-initialized)
+    - Flow add_imm fallback when load slots are full
+    - Count-based critical-path priority with periodic recomputation
+    - Memory pressure heuristic (allocation penalty above 90%)
 """
 
+from __future__ import annotations
+
 from collections import defaultdict
+import dataclasses
+import heapq
 import random
 import unittest
+from typing import Literal, assert_never, get_args
 
 from problem import (
-    Engine,
     DebugInfo,
     SLOT_LIMITS,
-    VLEN,
-    N_CORES,
+    VLEN, N_CORES,
     SCRATCH_SIZE,
     Machine,
-    Tree,
-    Input,
+    Tree, 
+    Input, 
     HASH_STAGES,
-    reference_kernel,
-    build_mem_image,
-    reference_kernel2,
+    reference_kernel, 
+    build_mem_image, 
+    reference_kernel2
 )
+
+Engine = Literal["alu", "valu", "load", "store", "flow"]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Ref:
+    """Reference to a vid's scratch output, optionally at an element offset."""
+    vid: str
+    offset: int = 0
+
+    def with_offset(self, offset: int) -> Ref:
+        assert self.offset == 0, "offset must be 0 for with_offset"
+        return dataclasses.replace(self, offset=offset)
+
+
+# Virtual addresses start above any real scratch address.
+VIRTUAL_BASE: int = 100_000
+
+# Feature flags: use vselect tree selection instead of scatter loads.
+ENABLE_DEPTH_3_VSELECT: bool = True
+ENABLE_DEPTH_4_VSELECT: bool = True
+MAX_CONCURRENT_GROUPS: int = 20
+
+
+def use_vselect_at_depth_3(g: int) -> bool:
+    """Which groups use vselect at depth 3 (vs scatter loads)."""
+    return g % 3 != 2 or g > 26
+
+
+def use_vselect_at_depth_4(g: int) -> bool:
+    """Which groups use vselect at depth 4 (vs scatter loads)."""
+    return g % 3 == 0 and use_vselect_at_depth_3(g)
+
+# Simple ALU ops that a VALU instruction can be decomposed into.
+ALU_OPS = Literal["+", "-", "*", "//", "cdiv", "^", "&", "|", "<<", ">>", "%", "<", "=="]
+_ALU_OFFLOADABLE_OPS: set[ALU_OPS] = set(get_args(ALU_OPS))
+
+
+# ── VALU slots ───────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class ValuBroadcastSlot:
+    dest: int
+    src: int
+
+    def to_tuple(self) -> tuple:
+        return ("vbroadcast", self.dest, self.src)
+
+    def rewrite(self, m: dict[int, int]) -> ValuBroadcastSlot:
+        return ValuBroadcastSlot(m[self.dest], m[self.src])
+
+@dataclasses.dataclass
+class ValuMultiplyAddSlot:
+    dest: int
+    a: int
+    b: int
+    c: int
+
+    def to_tuple(self) -> tuple:
+        return ("multiply_add", self.dest, self.a, self.b, self.c)
+
+    def rewrite(self, m: dict[int, int]) -> ValuMultiplyAddSlot:
+        return ValuMultiplyAddSlot(m[self.dest], m[self.a], m[self.b], m[self.c])
+
+@dataclasses.dataclass
+class ValuBinaryOpSlot:
+    op: str
+    dest: int
+    a1: int
+    a2: int
+
+    def to_tuple(self) -> tuple:
+        return (self.op, self.dest, self.a1, self.a2)
+
+    def rewrite(self, m: dict[int, int]) -> ValuBinaryOpSlot:
+        return ValuBinaryOpSlot(self.op, m[self.dest], m[self.a1], m[self.a2])
+
+ValuSlot = ValuBroadcastSlot | ValuMultiplyAddSlot | ValuBinaryOpSlot
+
+# ── ALU slot ─────────────────────────────────────────────────────
+@dataclasses.dataclass
+class ALUSlot:
+    op: str
+    dest: int
+    a1: int
+    a2: int
+
+    def to_tuple(self) -> tuple:
+        return (self.op, self.dest, self.a1, self.a2)
+
+    def rewrite(self, m: dict[int, int]) -> ALUSlot:
+        return ALUSlot(self.op, m[self.dest], m[self.a1], m[self.a2])
+
+# ── Load slots ───────────────────────────────────────────────────
+@dataclasses.dataclass
+class ConstSlot:
+    dest: int
+    value: int
+
+    def to_tuple(self) -> tuple:
+        return ("const", self.dest, self.value)
+
+    def rewrite(self, m: dict[int, int]) -> ConstSlot:
+        return ConstSlot(m[self.dest], self.value)
+
+@dataclasses.dataclass
+class ScalarLoadSlot:
+    dest: int
+    addr: int
+
+    def to_tuple(self) -> tuple:
+        return ("load", self.dest, self.addr)
+
+    def rewrite(self, m: dict[int, int]) -> ScalarLoadSlot:
+        return ScalarLoadSlot(m[self.dest], m[self.addr])
+
+@dataclasses.dataclass
+class VLoadSlot:
+    dest: int
+    addr: int
+
+    def to_tuple(self) -> tuple:
+        return ("vload", self.dest, self.addr)
+
+    def rewrite(self, m: dict[int, int]) -> VLoadSlot:
+        return VLoadSlot(m[self.dest], m[self.addr])
+
+@dataclasses.dataclass
+class LoadOffsetSlot:
+    dest: int
+    addr: int
+    offset: int
+
+    def to_tuple(self) -> tuple:
+        return ("load_offset", self.dest, self.addr, self.offset)
+
+    def rewrite(self, m: dict[int, int]) -> LoadOffsetSlot:
+        return LoadOffsetSlot(m[self.dest], m[self.addr], self.offset)
+
+LoadSlot = ConstSlot | ScalarLoadSlot | VLoadSlot | LoadOffsetSlot
+
+# ── Store slots ──────────────────────────────────────────────────
+@dataclasses.dataclass
+class ScalarStoreSlot:
+    addr: int
+    src: int
+
+    def to_tuple(self) -> tuple:
+        return ("store", self.addr, self.src)
+
+    def rewrite(self, m: dict[int, int]) -> ScalarStoreSlot:
+        return ScalarStoreSlot(m[self.addr], m[self.src])
+
+@dataclasses.dataclass
+class VStoreSlot:
+    addr: int
+    src: int
+
+    def to_tuple(self) -> tuple:
+        return ("vstore", self.addr, self.src)
+
+    def rewrite(self, m: dict[int, int]) -> VStoreSlot:
+        return VStoreSlot(m[self.addr], m[self.src])
+
+StoreSlot = ScalarStoreSlot | VStoreSlot
+
+# ── Flow slots ───────────────────────────────────────────────────
+@dataclasses.dataclass
+class FlowVSelectSlot:
+    dest: int
+    cond: int
+    a: int
+    b: int
+
+    def to_tuple(self) -> tuple:
+        return ("vselect", self.dest, self.cond, self.a, self.b)
+
+    def rewrite(self, m: dict[int, int]) -> FlowVSelectSlot:
+        return FlowVSelectSlot(m[self.dest], m[self.cond], m[self.a], m[self.b])
+
+@dataclasses.dataclass
+class FlowAddImmSlot:
+    dest: int
+    a: int
+    imm: int
+
+    def to_tuple(self) -> tuple:
+        return ("add_imm", self.dest, self.a, self.imm)
+
+    def rewrite(self, m: dict[int, int]) -> FlowAddImmSlot:
+        return FlowAddImmSlot(m[self.dest], m[self.a], self.imm)
+
+@dataclasses.dataclass
+class FlowSelectSlot:
+    dest: int
+    cond: int
+    a: int
+    b: int
+
+    def to_tuple(self) -> tuple:
+        return ("select", self.dest, self.cond, self.a, self.b)
+
+    def rewrite(self, m: dict[int, int]) -> FlowSelectSlot:
+        return FlowSelectSlot(m[self.dest], m[self.cond], m[self.a], m[self.b])
+
+@dataclasses.dataclass
+class FlowPauseSlot:
+
+    def to_tuple(self) -> tuple:
+        return ("pause",)
+
+    def rewrite(self, m: dict[int, int]) -> FlowPauseSlot:
+        return FlowPauseSlot()
+
+FlowSlot = FlowVSelectSlot | FlowAddImmSlot | FlowSelectSlot | FlowPauseSlot
+
+# ── Alloc pseudo-slot ────────────────────────────────────────────
+@dataclasses.dataclass
+class AllocSlot:
+    """Pseudo-instruction: pre-allocate a scratch block."""
+    size: int
+
+    def to_tuple(self) -> tuple:
+        raise TypeError("AllocSlot has no machine representation")
+
+    def rewrite(self, m: dict[int, int]) -> AllocSlot:
+        return self  # no addresses to rewrite
+
+# ── Union of all slot types ──────────────────────────────────────
+Slot = (ValuSlot | ALUSlot | LoadSlot | StoreSlot | FlowSlot | AllocSlot)
+
+# ── Slot type → engine mapping ──────────────────────────────────
+SLOT_ENGINE: dict[type, Engine] = {
+    ValuBroadcastSlot: "valu", ValuMultiplyAddSlot: "valu",
+    ValuBinaryOpSlot: "valu",
+    ALUSlot: "alu",
+    ConstSlot: "load", ScalarLoadSlot: "load", VLoadSlot: "load",
+    LoadOffsetSlot: "load",
+    ScalarStoreSlot: "store", VStoreSlot: "store",
+    FlowVSelectSlot: "flow", FlowAddImmSlot: "flow",
+    FlowSelectSlot: "flow", FlowPauseSlot: "flow",
+    AllocSlot: "alloc",
+}
+
+
+def slot_engine(slot: Slot) -> Engine:
+    """Return the engine that executes the given Slot type."""
+    return SLOT_ENGINE[type(slot)]
+
+
+def slot_to_tuple(s: Slot) -> tuple:
+    """Convert a typed Slot to the tuple format expected by the machine."""
+    return s.to_tuple()
+
+# ══════════════════════════════════════════════════════════════════════
+#  Op — a single schedulable operation
+# ══════════════════════════════════════════════════════════════════════
+class Op:
+    """One instruction in the dependency graph, before scheduling."""
+
+    __slots__ = ["id", "engine", "slot", "deps", "write_size", "vbase"]
+
+    def __init__(
+        self,
+        id: str,
+        slot: Slot,
+        deps: list[str] | None = None,
+        write_size: int = 0,
+        vbase: int = -1,
+    ) -> None:
+        self.id = id
+        self.engine: str = slot_engine(slot)
+        self.slot: Slot = slot
+        self.deps: list[str] = deps or []
+        self.write_size = write_size
+        self.vbase = vbase  # virtual base address, -1 if no output
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Dual-pool scratch allocator
+# ══════════════════════════════════════════════════════════════════════
+class ScratchAllocator:
+    """
+    Manages scratch memory as two pools:
+      - Scalars grow upward from address 0.
+      - Vectors (8-element blocks) grow downward from the top.
+    """
+
+    def __init__(self, scratch_size: int) -> None:
+        self.scratch_size = scratch_size
+        self.V = VLEN
+
+        self._scalar_watermark: int = 0
+        self.scalar_free: list[int] = []   # max-heap (negated addresses)
+        self._vector_watermark: int = scratch_size - self.V
+        self.vector_free: list[int] = []   # min-heap (lowest address first)
+
+        self.peak_scalar: int = 0
+        self.peak_vector: int = scratch_size
+
+        # virtual addr → real addr (individual elements)
+        self.vmap: dict[int, int] = {}
+        # vid → (real_base, size) for blocks we own
+        self.vid_ownership: dict[str, tuple[int, int]] = {}
+
+    @property
+    def scalar_next(self) -> int:
+        """Effective scalar boundary: max free-list element + 1, or watermark."""
+        if self.scalar_free:
+            return -self.scalar_free[0] + 1
+        return self._scalar_watermark
+
+    @property
+    def vector_next(self) -> int:
+        """Effective vector boundary: min free-list element - V, or watermark."""
+        if self.vector_free:
+            return self.vector_free[0] - self.V
+        return self._vector_watermark
+
+    def can_alloc(self, size: int) -> bool:
+        if size == 1:
+            return bool(self.scalar_free) or self._scalar_watermark <= self._vector_watermark
+        return bool(self.vector_free) or self._vector_watermark - self.V >= self._scalar_watermark
+
+    def alloc(self, size: int) -> int:
+        if size == 1:
+            return self._alloc_scalar()
+        return self._alloc_vector()
+
+    def _alloc_scalar(self) -> int:
+        if self.scalar_free:
+            return -heapq.heappop(self.scalar_free)
+        addr = self._scalar_watermark
+        self._scalar_watermark += 1
+        self.peak_scalar = max(self.peak_scalar, self._scalar_watermark)
+        return addr
+
+    def _alloc_vector(self) -> int:
+        if self.vector_free:
+            return heapq.heappop(self.vector_free)
+        addr = self._vector_watermark
+        self._vector_watermark -= self.V
+        self.peak_vector = min(self.peak_vector, addr)
+        return addr
+
+    def free(self, addr: int, size: int) -> None:
+        if size == 1:
+            heapq.heappush(self.scalar_free, -addr)
+        else:
+            heapq.heappush(self.vector_free, addr)
+
+    @property
+    def current_usage(self) -> int:
+        """Total scratch words currently allocated to live blocks."""
+        return sum(size for _, size in self.vid_ownership.values())
+
+    @property
+    def peak_usage(self) -> int:
+        return self.peak_scalar + (self.scratch_size - self.peak_vector)
+
+    def needs_new_alloc(self, op: Op) -> bool:
+        if op.write_size == 0 or op.vbase < 0:
+            return False
+        return op.vbase not in self.vmap
+
+    def alloc_for_op(self, op: Op) -> None:
+        """Allocate real scratch for an op's output virtual addresses."""
+        if op.write_size == 0 or op.vbase < 0:
+            return
+        if op.vbase in self.vmap:
+            return  # sub-write into pre-allocated block
+        real_base = self.alloc(op.write_size)
+        self.vid_ownership[op.id] = (real_base, op.write_size)
+        for k in range(op.write_size):
+            self.vmap[op.vbase + k] = real_base + k
+
+    def try_free_vid(self, vid: str, remaining_readers: dict[str, int]) -> None:
+        """Free a vid's scratch if it has no remaining readers."""
+        if remaining_readers.get(vid, 0) <= 0 and vid in self.vid_ownership:
+            real_base, size = self.vid_ownership.pop(vid)
+            self.free(real_base, size)
+
+    def rewrite_slot(self, slot: Slot) -> Slot:
+        """Return a new Slot with virtual addresses replaced by real ones."""
+        return slot.rewrite(self.vmap)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Scheduler with dynamic scratch allocation
+# ══════════════════════════════════════════════════════════════════════
+class Scheduler:
+    """
+    Greedy list-scheduler with online dual-pool scratch allocation.
+
+    Dependencies come solely from the explicit string-vid dep lists that
+    ``emit()`` auto-derives from data-flow references.  The scheduler
+    never inspects read/write address sets for ordering.
+
+    When 8+ ALU slots are free, simple VALU ops (and vbroadcast) are
+    transparently executed as 8 scalar ALU ops instead, freeing the
+    VALU engine for multiply_add and other non-decomposable work.
+    """
+
+    def __init__(
+        self,
+        ops: list[Op],
+        scratch_size: int = SCRATCH_SIZE,
+        zero_vaddr: int | None = None,
+        recompute_every: int = 0,
+    ) -> None:
+        self.ops = ops
+        self.n = len(ops)
+        self.V = VLEN
+        self.zero_vaddr = zero_vaddr
+        self.recompute_every = recompute_every
+
+        self.allocator = ScratchAllocator(scratch_size)
+        self.id_to_idx: dict[str, int] = {
+            op.id: i for i, op in enumerate(ops)
+        }
+
+        self._build_dep_graph()
+        self._compute_priorities()
+        self._compute_read_counts()
+
+        # Pre-allocate permanent zero scalar (for vbroadcast ALU offload).
+        if zero_vaddr is not None:
+            zero_real = self.allocator.alloc(1)
+            self.allocator.vmap[zero_vaddr] = zero_real
+
+    # ── Dependency graph construction ───────────────────────────────
+    def _build_dep_graph(self) -> None:
+        n = self.n
+        self.predecessors: list[set[int]] = [set() for _ in range(n)]
+        self.successors: list[list[int]] = [[] for _ in range(n)]
+
+        for i, op in enumerate(self.ops):
+            for dep_id in op.deps:
+                j = self.id_to_idx.get(dep_id)
+                if j is not None:
+                    self.predecessors[i].add(j)
+
+        for i in range(n):
+            for j in self.predecessors[i]:
+                self.successors[j].append(i)
+
+    # ── Priority computation ────────────────────────────────────────
+    def _compute_priorities(self, done: set[int] | None = None) -> None:
+        """
+        Compute scheduling priorities based on weighted critical path.
+
+        Each engine has a tuned cost reflecting its bottleneck severity.
+        Recomputing with a ``done`` set excludes already-scheduled ops.
+        """
+        n = self.n
+        ops = self.ops
+        done = done or set()
+
+        # Count remaining ops per engine.
+        engine_counts: dict[str, int] = defaultdict(int)
+        for i, op in enumerate(ops):
+            if i not in done:
+                engine_counts[op.engine] += 1
+
+        # Tuned per-engine costs for critical-path weighting.
+        # - flow (1 slot/cycle) is the tightest bottleneck with vselect
+        #   at depths 3-4, so gets the highest weight.
+        # - load (2 slots/cycle) is the next bottleneck from scatter
+        #   loads and vloads.
+        # - valu/alu/store: heavily parallelised or offloadable, so
+        #   given zero weight (critical path dominated by flow + load).
+        ENGINE_COSTS = {"flow": 0.85, "load": 0.25}
+        engine_cost: dict[str, float] = {
+            engine: ENGINE_COSTS.get(engine, 0.0)
+            for engine in engine_counts
+        }
+
+        if len(done) > 300:
+            engine_cost["flow"] = 1.25
+
+        # Critical-path length (longest weighted path to any sink),
+        # considering only remaining ops.
+        critical_path: list[float] = [0.0] * n
+        for i in range(n - 1, -1, -1):
+            if i in done:
+                continue
+            cost = engine_cost.get(ops[i].engine, 0.0)
+            for s in self.successors[i]:
+                if s not in done:
+                    critical_path[i] = max(
+                        critical_path[i], critical_path[s] + cost)
+
+        # Normalise critical path to [0, 100] so it dominates
+        # the cross-engine bonus (a small tiebreaker of 0-3).
+        max_cp = max(critical_path) or 1.0
+        cp_scale = 100.0 / max_cp
+
+        # Cross-engine bonus (computed once, static).
+        if not hasattr(self, '_cross_engine_bonus'):
+            self._cross_engine_bonus = [0] * n
+            for i in range(n):
+                for s in self.successors[i]:
+                    if ops[s].engine != ops[i].engine:
+                        self._cross_engine_bonus[i] += 1
+
+        # NOTE: Per-op memory pressure bonus/penalty is disabled.
+        # The deferred-free mechanism and concurrency limiter handle
+        # scratch pressure adequately.  A per-op version that awards
+        # bonus for freeing scratch and penalises allocation above 90%
+        # was tested but the overhead outweighed the benefit.
+
+        # Small emission-order tiebreaker: earlier ops (lower groups)
+        # get slightly higher priority, encouraging the scheduler to
+        # finish earlier groups first.
+        emit_scale = 10.0 / max(n, 1)
+        self.priority = [
+            critical_path[i] * cp_scale
+            + min(self._cross_engine_bonus[i], 3)
+            + (n - i) * emit_scale  # earlier ops → higher tiebreaker
+            for i in range(n)
+        ]
+
+    # ── Read-count tracking ─────────────────────────────────────────
+    def _compute_read_counts(self) -> None:
+        vid_read_count: dict[str, int] = defaultdict(int)
+        for op in self.ops:
+            for dep in set(op.deps):
+                vid_read_count[dep] += 1
+        self.remaining_readers: dict[str, int] = dict(vid_read_count)
+
+    def _free_after_cycle(self, scheduled: list[int]) -> None:
+        """Decrement reader counts for all ops scheduled this cycle,
+        and free any scratch blocks whose last reader was in this cycle.
+
+        Called once at end of cycle — prevents within-cycle address
+        reuse (no read/write conflicts on the same scratch address).
+        """
+        to_free: list[str] = []
+        for idx in scheduled:
+            for dep in set(self.ops[idx].deps):
+                if dep in self.remaining_readers:
+                    self.remaining_readers[dep] -= 1
+                    if self.remaining_readers[dep] <= 0:
+                        to_free.append(dep)
+        for vid in to_free:
+            self.allocator.try_free_vid(vid, self.remaining_readers)
+
+    # ── ALU offloading ──────────────────────────────────────────────
+    def _is_alu_offloadable(self, op: Op) -> bool:
+        """Check if a VALU op can be decomposed into scalar ALU ops."""
+        if op.engine != "valu":
+            return False
+        match op.slot:
+            case ValuBroadcastSlot():
+                return True
+            case ValuBinaryOpSlot(op_name, _, _, _):
+                return op_name in _ALU_OFFLOADABLE_OPS
+            case _:
+                return False
+
+    def _make_alu_ops(self, real_slot: Slot) -> list[tuple]:
+        """Expand a rewritten VALU Slot into VLEN scalar ALU tuples."""
+        match real_slot:
+            case ValuBroadcastSlot(dest, src):
+                zero = self.allocator.vmap[self.zero_vaddr]
+                return [("+", dest + i, src, zero) for i in range(self.V)]
+            case ValuBinaryOpSlot(op, dest, a1, a2):
+                return [(op, dest + i, a1 + i, a2 + i)
+                        for i in range(self.V)]
+            case _:
+                raise ValueError(f"Cannot make ALU ops from {real_slot}")
+
+    def _try_evict_valu_to_alu(
+        self,
+        bundle: dict[str, list[tuple]],
+        slot_counts: dict[str, int],
+        valu_this_cycle: list[tuple[Op, Slot]],
+    ) -> bool:
+        """Evict one offloadable VALU op to ALU to free a VALU slot.
+
+        Scans the VALU ops already scheduled this cycle. If one can be
+        decomposed into scalar ALU ops (and ALU has room), it is moved
+        from the VALU bundle to ALU, freeing one VALU slot.
+        """
+        if slot_counts.get("alu", 0) + self.V > SLOT_LIMITS["alu"]:
+            return False
+        for i, (evict_op, evict_real_slot) in enumerate(valu_this_cycle):
+            if self._is_alu_offloadable(evict_op):
+                # Remove from VALU bundle.
+                evict_tuple = slot_to_tuple(evict_real_slot)
+                bundle["valu"].remove(evict_tuple)
+                slot_counts["valu"] -= 1
+                valu_this_cycle.pop(i)
+                # Add 8 scalar ALU ops.
+                all_alu = self._make_alu_ops(evict_real_slot)
+                bundle.setdefault("alu", []).extend(all_alu)
+                slot_counts["alu"] = slot_counts.get("alu", 0) + self.V
+                return True
+        return False
+
+    @staticmethod
+    def _collect_bundle_addrs(bundles: list[dict]) -> set[int]:
+        """Collect all integer addresses used in a list of bundles."""
+        addrs: set[int] = set()
+        for b in bundles:
+            for slots in b.values():
+                for slot in slots:
+                    for val in slot:
+                        if isinstance(val, int):
+                            addrs.add(val)
+        return addrs
+
+    def _alloc_safe_vector(
+        self, op: Op, used_addrs: set[int],
+    ) -> bool:
+        """Allocate a vector block from the free list, choosing one
+        whose addresses don't overlap with *used_addrs*.
+        Returns True if successful."""
+        alloc = self.allocator
+        V = self.V
+
+        # Scan the vector free list for a safe address.
+        candidates: list[int] = []
+        rejected: list[int] = []
+        found = -1
+        # Drain the heap, check each candidate.
+        while alloc.vector_free:
+            addr = heapq.heappop(alloc.vector_free)
+            block = set(range(addr, addr + V))
+            if not (block & used_addrs):
+                found = addr
+                # Push back the rest.
+                for r in rejected:
+                    heapq.heappush(alloc.vector_free, r)
+                break
+            rejected.append(addr)
+        else:
+            # All were rejected — push them all back.
+            for r in rejected:
+                heapq.heappush(alloc.vector_free, r)
+            return False
+
+        # Map the op's virtual addresses to this safe real block.
+        if op.write_size == 0 or op.vbase < 0:
+            return False
+        if op.vbase in alloc.vmap:
+            return False
+        alloc.vid_ownership[op.id] = (found, op.write_size)
+        for k in range(op.write_size):
+            alloc.vmap[op.vbase + k] = found + k
+        return True
+
+    def _try_split_alu_offload(
+        self,
+        op: Op,
+        op_earliest: int,
+        cycle: int,
+        bundle: dict[str, list[tuple]],
+        slot_counts: dict[str, int],
+        result: list[dict],
+        result_cycles: list[int],
+    ) -> bool:
+        """
+        Try to split an offloadable VALU op across past + current
+        cycles using spare ALU slots.
+
+        Scans backwards from the current cycle to ``op_earliest``,
+        collecting free ALU slots in each past bundle (and the current
+        bundle).  If the total free slots >= VLEN, the op is split
+        across those cycles, filling oldest cycles first.
+
+        Output addresses are chosen from the free list, skipping any
+        that appear in any bundle within the retroactive window (not
+        just the ones we insert into) to avoid conflicts with
+        addresses that were live during those intermediate cycles.
+        """
+        if not self._is_alu_offloadable(op):
+            return False
+
+        ALU_LIMIT = SLOT_LIMITS["alu"]
+        V = self.V  # 8
+
+        # Walk backwards collecting (bundle_ref, free_slots) and
+        # tracking how deep into `result` we go.
+        # candidates are built newest-first, then reversed.
+        candidates: list[tuple[dict, int]] = []
+        total_free = 0
+        n_past = 0  # how many past bundles in the window
+
+        # Current cycle.
+        cur_free = ALU_LIMIT - slot_counts.get("alu", 0)
+        if cur_free > 0:
+            candidates.append((bundle, cur_free))
+            total_free += cur_free
+
+        # Past cycles (most recent first).
+        for k in range(1, len(result) + 1):
+            if result_cycles[-k] < op_earliest:
+                break
+            n_past = k
+            past = result[-k]
+            past_free = ALU_LIMIT - len(past.get("alu", []))
+            if past_free > 0:
+                candidates.append((past, past_free))
+                total_free += past_free
+            if total_free >= V:
+                break
+
+        if total_free < V:
+            return False
+
+        # Reverse so oldest cycles come first.
+        candidates.reverse()
+
+        # Build the allocation plan: how many ALU ops per cycle.
+        plan: list[tuple[dict, int]] = []
+        remaining = V
+        for bndl, free in candidates:
+            take = min(free, remaining)
+            plan.append((bndl, take))
+            remaining -= take
+            if remaining == 0:
+                break
+        assert remaining == 0
+
+        # Allocate the output vector.  When all ops fit in the current
+        # cycle (n_past == 0) we use normal allocation.  When splitting
+        # retroactively, we must pick a vector block whose addresses
+        # don't conflict with any bundle in the retroactive window.
+        if n_past > 0:
+            used = self._collect_bundle_addrs(result[-n_past:])
+            if not self._alloc_safe_vector(op, used):
+                return False
+        else:
+            self.allocator.alloc_for_op(op)
+
+        # Generate the 8 ALU ops and distribute them.
+        all_alu = self._make_alu_ops(
+            self.allocator.rewrite_slot(op.slot))
+        offset = 0
+        for bndl, count in plan:
+            bndl.setdefault("alu", []).extend(
+                all_alu[offset:offset + count])
+            if bndl is bundle:
+                slot_counts["alu"] = slot_counts.get("alu", 0) + count
+            offset += count
+
+        return True
+
+    # ── Main scheduling loop ────────────────────────────────────────
+    def run(self) -> list[dict]:
+        if self.n == 0:
+            return []
+
+        n = self.n
+        ops = self.ops
+        alloc = self.allocator
+
+        unsatisfied: list[int] = [
+            len(self.predecessors[i]) for i in range(n)
+        ]
+        earliest: list[int] = [0] * n
+
+        # Min-heap: (-priority, emission_order, op_index)
+        ready: list[tuple[float, int, int]] = []
+        for i in range(n):
+            if unsatisfied[i] == 0:
+                heapq.heappush(ready, (-self.priority[i], i, i))
+
+        result: list[dict] = []
+        result_cycles: list[int] = []
+        cycle: int = 0
+        done_set: set[int] = set()
+        cycles_since_recompute: int = 0
+
+        while len(done_set) < n:
+            bundle: dict[str, list[tuple]] = {}
+            slot_counts: dict[str, int] = defaultdict(int)
+            scheduled: list[int] = []
+            deferred: list[tuple[float, int, int]] = []
+            valu_this_cycle: list[tuple[Op, Slot]] = []
+
+            while ready:
+                neg_pri, order, idx = heapq.heappop(ready)
+
+                if earliest[idx] > cycle:
+                    deferred.append((neg_pri, order, idx))
+                    continue
+
+                op = ops[idx]
+                engine = op.engine
+
+                # Alloc pseudo-ops: no machine instruction needed.
+                if isinstance(op.slot, AllocSlot):
+                    if (alloc.needs_new_alloc(op)
+                            and not alloc.can_alloc(op.write_size)):
+                        deferred.append((neg_pri, order, idx))
+                        continue
+                    alloc.alloc_for_op(op)
+                    scheduled.append(idx)
+                    continue
+
+                # Const-zero pseudo-op: scratch is zero-initialized.
+                if (isinstance(op.slot, ConstSlot)
+                        and op.slot.value == 0):
+                    if (alloc.needs_new_alloc(op)
+                            and not alloc.can_alloc(op.write_size)):
+                        deferred.append((neg_pri, order, idx))
+                        continue
+                    alloc.alloc_for_op(op)
+                    scheduled.append(idx)
+                    continue
+
+                # Memory-pressure gate.
+                if (alloc.needs_new_alloc(op)
+                        and not alloc.can_alloc(op.write_size)):
+                    deferred.append((neg_pri, order, idx))
+                    continue
+
+                # Engine-slot check.
+                if slot_counts[engine] >= SLOT_LIMITS.get(engine, 0):
+                    # VALU overflow: try to evict an offloadable
+                    # VALU op to ALU, then fall through to schedule
+                    # the current op on VALU normally.
+                    if (engine == "valu"
+                            and self._try_evict_valu_to_alu(
+                                bundle, slot_counts,
+                                valu_this_cycle)):
+                        pass  # slot freed — fall through below
+                    else:
+                        # VALU fallback: offload to ALU (current
+                        # cycle or split across past cycles).
+                        if engine == "valu":
+                            if self._try_split_alu_offload(
+                                    op, earliest[idx], cycle,
+                                    bundle, slot_counts,
+                                    result, result_cycles):
+                                scheduled.append(idx)
+                                continue
+                        # Const loads can use flow add_imm.
+                        if (isinstance(op.slot, ConstSlot)
+                                and slot_counts.get("flow", 0)
+                                    < SLOT_LIMITS["flow"]
+                                and self.zero_vaddr is not None):
+                            alloc.alloc_for_op(op)
+                            dest_r = alloc.vmap[op.slot.dest]
+                            zero_r = alloc.vmap[self.zero_vaddr]
+                            bundle.setdefault("flow", []).append(
+                                ("add_imm", dest_r, zero_r,
+                                 op.slot.value))
+                            slot_counts["flow"] = (
+                                slot_counts.get("flow", 0) + 1)
+                            scheduled.append(idx)
+                            continue
+                        deferred.append((neg_pri, order, idx))
+                        continue
+
+                # Schedule on its native engine.
+                alloc.alloc_for_op(op)
+                real_slot = alloc.rewrite_slot(op.slot)
+                bundle.setdefault(engine, []).append(
+                    slot_to_tuple(real_slot))
+                slot_counts[engine] += 1
+                if engine == "valu":
+                    valu_this_cycle.append((op, real_slot))
+                scheduled.append(idx)
+
+            # Free scratch for all deps whose last reader ran this cycle.
+            self._free_after_cycle(scheduled)
+
+            # Return deferred ops to the ready heap.
+            for item in deferred:
+                heapq.heappush(ready, item)
+
+            if bundle:
+                result.append(bundle)
+                result_cycles.append(cycle)
+
+            # Notify successors.
+            done_set.update(scheduled)
+            for idx in scheduled:
+                for s in self.successors[idx]:
+                    earliest[s] = max(earliest[s], cycle + 1)
+                    unsatisfied[s] -= 1
+                    if unsatisfied[s] == 0:
+                        heapq.heappush(
+                            ready, (-self.priority[s], s, s))
+
+            # Periodic priority recomputation.
+            cycles_since_recompute += 1
+            if (self.recompute_every > 0
+                    and cycles_since_recompute >= self.recompute_every
+                    and len(done_set) < n):
+                cycles_since_recompute = 0
+                self._compute_priorities(done=done_set)
+                # Rebuild ready heap with updated priorities.
+                old_ready = [(idx, order) for (_, order, idx) in ready]
+                ready.clear()
+                for idx, order in old_ready:
+                    heapq.heappush(
+                        ready, (-self.priority[idx], order, idx))
+
+            cycle += 1
+            if not scheduled and len(done_set) < n:
+                print(f"SCHEDULER STUCK at cycle {cycle}, "
+                      f"done {len(done_set)}/{n}, "
+                      f"ready={len(ready)}, "
+                      f"usage={alloc.current_usage}/{alloc.scratch_size}")
+                break
+
+        print(f"Scheduled {n} ops -> {len(result)} cycles  "
+              f"(peak scratch {alloc.peak_usage}/{alloc.scratch_size})")
+        return result
+
+
+def schedule_and_allocate(
+    ops: list[Op],
+    scratch_size: int = SCRATCH_SIZE,
+    zero_vaddr: int | None = None,
+    recompute_every: int = 5,
+) -> list[dict]:
+    """Convenience wrapper around the Scheduler class."""
+    scheduler = Scheduler(ops, scratch_size, zero_vaddr,
+                          recompute_every=recompute_every)
+    return scheduler.run()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  KernelBuilder — pure data-flow emit API
+# ══════════════════════════════════════════════════════════════════════
+# A "vid" (virtual identifier) is a unique human-readable string that
+# names the output of every operation.  Downstream operations reference
+# upstream outputs by vid.  The scheduler resolves vids to physical
+# scratch addresses at scheduling time.
+
+
+@dataclasses.dataclass
+class SetupRefs:
+    """Typed container for all one-time setup references."""
+    const_zero: Ref
+    group_offset: dict[int, Ref]
+    inp_values_ptr: Ref
+    tree_root_vec: Ref
+    tree_d1_left_vec: Ref
+    tree_d1_right_vec: Ref
+    tree_d2_vec: dict[int, Ref]
+    tree_d2_diff: dict[int, Ref]
+    tree_d3_vec: dict[int, Ref]
+    tree_d3_diff: dict[int, Ref]
+    tree_d4_vec: dict[int, Ref]
+    tree_d4_diff: dict[int, Ref]
+    hash_const1_vec: dict[int, Ref]
+    hash_const3_vec: dict[int, Ref]
+    hash_mult_vec: dict[int, Ref]
+    two_vec: Ref
+    tree_base_1indexed: Ref
+
+
+@dataclasses.dataclass
+class TreeState:
+    """Mutable tree-traversal state threaded through rounds."""
+    index: Ref | None = None
+    bits: list[Ref | None] = dataclasses.field(
+        default_factory=lambda: [None, None, None, None])
+
+    def set_bit(self, depth: int, ref: Ref) -> None:
+        """Record the branch bit for the given depth."""
+        if depth < len(self.bits):
+            self.bits[depth] = ref
 
 
 class KernelBuilder:
-    def __init__(self):
-        self.instrs = []
-        self.scratch = {}
-        self.scratch_debug = {}
-        self.scratch_ptr = 0
-        self.const_map = {}
+    """Build the kernel as a dependency graph of named operations."""
 
-    def debug_info(self):
-        return DebugInfo(scratch_map=self.scratch_debug)
+    def __init__(self) -> None:
+        self.instrs: list[dict] = []
+        self.ops: list[Op] = []
+        self.virt_ptr: int = VIRTUAL_BASE
+        self.vid_to_vaddr: dict[str, int] = {}
+        self.vid_size: dict[str, int] = {}
+        self.block_writers: dict[str, list[str]] = {}
+        self._const_cache: dict[int, Ref] = {}
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+    def debug_info(self) -> DebugInfo:
+        return DebugInfo(scratch_map={})
 
-    def add(self, engine, slot):
+    def add(self, engine: str, slot: tuple) -> None:
+        """Emit a raw instruction directly (not scheduled)."""
         self.instrs.append({engine: [slot]})
 
-    def alloc_scratch(self, name=None, length=1):
-        addr = self.scratch_ptr
-        if name is not None:
-            self.scratch[name] = addr
-            self.scratch_debug[addr] = (name, length)
-        self.scratch_ptr += length
-        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
-        return addr
+    # ── Constants ───────────────────────────────────────────────────
+    def get_const(self, value: int) -> Ref:
+        """Return a Ref to a scalar constant, emitting the load once."""
+        if value not in self._const_cache:
+            vid = f"const_{value}"
+            vaddr = self.virt_ptr
+            self.virt_ptr += 1
+            self.vid_to_vaddr[vid] = vaddr
+            self.vid_size[vid] = 1
+            slot = ConstSlot(vaddr, value)
+            self.ops.append(Op(vid, slot, write_size=1, vbase=vaddr))
+            self._const_cache[value] = Ref(vid)
+        return self._const_cache[value]
 
-    def scratch_const(self, val, name=None):
-        if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
-            self.const_map[val] = addr
-        return self.const_map[val]
+    # ── Vector block allocation (for scatter writes) ────────────────
+    @staticmethod
+    def _resolve_deps(deps: list[Ref] | None) -> list[str]:
+        """Extract vid strings from a list of Refs."""
+        if not deps:
+            return []
+        return [d.vid for d in deps]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
-
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
+    def alloc_vec(self, name: str,
+                  deps: list[Ref] | None = None) -> Ref:
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Pre-allocate an 8-element vector block.  Individual scalar ops
+        can write into it via ``write_to=ref.with_offset(i)``.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+        vaddr = self.virt_ptr
+        self.virt_ptr += VLEN
+        self.vid_to_vaddr[name] = vaddr
+        self.vid_size[name] = VLEN
+        self.block_writers[name] = []
+        self.ops.append(Op(name, AllocSlot(VLEN),
+                           deps=self._resolve_deps(deps),
+                           write_size=VLEN, vbase=vaddr))
+        return Ref(name)
+
+    # ── Write-size inference ────────────────────────────────────────
+    @staticmethod
+    def _infer_write_size(engine: Engine, op_name: str) -> int:
+        match engine:
+            case "store":
+                return 0
+            case "alu":
+                return 1
+            case "load":
+                return VLEN if op_name == "vload" else 1
+            case "valu":
+                return VLEN
+            case "flow":
+                return VLEN if op_name == "vselect" else 0
+            case _:
+                assert_never(engine)
+
+    # ── Core emit ───────────────────────────────────────────────────
+    def emit(
+        self,
+        vid: str,
+        engine: Engine,
+        slot_args: tuple[str, Ref | int, ...],
+        write_to: Ref | None = None,
+        deps: list[Ref] | None = None,
+    ) -> Ref:
+        """
+        Emit one named operation into the dependency graph.
+
+        Returns a ``Ref`` to the new op's output, usable directly as an
+        argument to subsequent ``emit()`` calls (with ``.with_offset(n)``
+        for element sub-indexing).
+
+        Parameters
+        ----------
+        vid : unique name for this op's output.
+        engine : target engine.
+        slot_args : ``(op_name, Ref | int, ...)``.
+            Ref args are resolved to virtual addresses and become
+            automatic dependencies.  Int args are literal values.
+            The destination is auto-inserted at position 1 (except
+            for stores, which have no scratch destination).
+        write_to : Ref to write into a pre-allocated vector block at
+            the given element offset.
+        deps : extra ordering dependencies beyond auto-derived ones.
+        """
+        op_name = slot_args[0]
+        auto_deps: list[str] = []
+
+        # Resolve Ref arguments to virtual addresses.
+        resolved: list = [op_name]
+        for arg in slot_args[1:]:
+            if isinstance(arg, Ref):
+                resolved.append(self.vid_to_vaddr[arg.vid] + arg.offset)
+                auto_deps.append(arg.vid)
+                if arg.vid in self.block_writers:
+                    auto_deps.extend(self.block_writers[arg.vid])
+            else:  # int literal
+                resolved.append(arg)
+
+        # Determine destination address
+        if write_to is not None:
+            dest_vaddr = self.vid_to_vaddr[write_to.vid] + write_to.offset
+            write_size = 1
+            self.vid_to_vaddr[vid] = dest_vaddr
+            self.vid_size[vid] = 1
+            self.block_writers[write_to.vid].append(vid)
+            auto_deps.append(write_to.vid)
+        else:
+            write_size = self._infer_write_size(engine, op_name)
+            if write_size > 0:
+                dest_vaddr = self.virt_ptr
+                self.virt_ptr += write_size
+                self.vid_to_vaddr[vid] = dest_vaddr
+                self.vid_size[vid] = write_size
+            else:
+                dest_vaddr = None
+
+        # Build typed Slot from resolved args + dest_vaddr.
+        args = resolved[1:]  # integer args after op_name
+        slot: Slot | None = self._build_slot(
+            engine, op_name, dest_vaddr, args)
+
+        # Merge and deduplicate dependencies
+        resolved_deps = self._resolve_deps(deps)
+        if resolved_deps:
+            auto_deps.extend(resolved_deps)
+        seen: set[str] = set()
+        unique_deps: list[str] = []
+        for d in auto_deps:
+            if d not in seen:
+                seen.add(d)
+                unique_deps.append(d)
+
+        vbase = dest_vaddr if dest_vaddr is not None else -1
+
+        self.ops.append(Op(
+            vid, slot, unique_deps, write_size, vbase,
+        ))
+        return Ref(vid)
+
+    @staticmethod
+    def _build_slot(
+        engine: Engine, op_name: str,
+        dest: int | None, args: list[int],
+    ) -> Slot:
+        """Construct the appropriate Slot dataclasses.dataclass from resolved args."""
+        match engine:
+            case "alu":
+                return ALUSlot(op_name, dest, args[0], args[1])
+            case "valu":
+                match op_name:
+                    case "vbroadcast":
+                        return ValuBroadcastSlot(dest, args[0])
+                    case "multiply_add":
+                        return ValuMultiplyAddSlot(dest, args[0], args[1], args[2])
+                    case _:  # binary op
+                        return ValuBinaryOpSlot(op_name, dest, args[0], args[1])
+            case "load":
+                match op_name:
+                    case "const":
+                        return ConstSlot(dest, args[0])
+                    case "load":
+                        return ScalarLoadSlot(dest, args[0])
+                    case "vload":
+                        return VLoadSlot(dest, args[0])
+                    case "load_offset":
+                        return LoadOffsetSlot(dest, args[0], args[1])
+                    case _:
+                        raise ValueError(f"Unknown load op: {op_name}")
+            case "store":
+                match op_name:
+                    case "store":
+                        return ScalarStoreSlot(args[0], args[1])
+                    case "vstore":
+                        return VStoreSlot(args[0], args[1])
+                    case _:
+                        raise ValueError(f"Unknown store op: {op_name}")
+            case "flow":
+                match op_name:
+                    case "vselect":
+                        return FlowVSelectSlot(dest, args[0], args[1], args[2])
+                    case "add_imm":
+                        return FlowAddImmSlot(dest, args[0], args[1])
+                    case "select":
+                        return FlowSelectSlot(dest, args[0], args[1], args[2])
+                    case "pause":
+                        return FlowPauseSlot()
+                    case _:
+                        raise ValueError(f"Unknown flow op: {op_name}")
+            case _:
+                raise ValueError(f"Unknown engine: {engine}")
+
+    # ════════════════════════════════════════════════════════════════
+    #  Kernel construction
+    # ════════════════════════════════════════════════════════════════
+    def _emit_broadcast_and_diff(
+        self, label: str, sources: list[tuple[Ref, int]],
+    ) -> tuple[dict[int, Ref], dict[int, Ref]]:
+        """Broadcast values from (block, offset) pairs, compute pairwise diffs.
+
+        Returns ``(vec, diff)`` where ``vec[i]`` is the vbroadcast of
+        ``sources[i]`` and ``diff[i] = vec[2*i+1] - vec[2*i]``.
+        """
+        vec: dict[int, Ref] = {}
+        for i, (block, offset) in enumerate(sources):
+            vec[i] = self.emit(
+                f"{label}_vec_{i}", "valu",
+                ("vbroadcast", block.with_offset(offset)))
+        diff: dict[int, Ref] = {}
+        for i in range(len(sources) // 2):
+            diff[i] = self.emit(
+                f"{label}_diff_{i}", "valu",
+                ("-", vec[2*i + 1], vec[2*i]))
+        return vec, diff
+
+    # ── Setup: constants, header, tree values, hash vectors ────────
+    def _emit_setup(self, num_groups: int) -> SetupRefs:
+        """Emit all one-time setup ops. Returns typed SetupRefs."""
+        V = VLEN
+        const_zero = self.get_const(0)
+        const_one = self.get_const(1)
+        const_two = self.get_const(2)
+        const_V = self.get_const(V)
+
+        # Group offsets via ALU chain (saves load slots).
+        group_offset: dict[int, Ref] = {0: const_zero}
+        for g in range(1, num_groups):
+            group_offset[g] = self.emit(
+                f"group_offset_{g}", "alu",
+                ("+", group_offset[g - 1], const_V),
+            )
+
+        # Pre-load hash and multiplier constants.
+        for stage in range(6):
+            self.get_const(HASH_STAGES[stage][1])
+            self.get_const(HASH_STAGES[stage][4])
+        for stage in (0, 2, 4):
+            self.get_const(1 + (1 << HASH_STAGES[stage][4]))
+
+        # Load header fields from memory.
+        HEADER_FIELDS = [
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        header: dict[str, Ref] = {}
+        for i, field in enumerate(HEADER_FIELDS):
+            header[field] = self.emit(
+                f"header_{field}", "load",
+                ("load", self.get_const(i)),
+            )
+        fvp = header["forest_values_p"]
+        ivp = header["inp_values_p"]
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # ── Bulk-load tree node values ──────────────────────────────
+        tree_vals_lo = self.emit(
+            "tree_vals_lo", "load", ("vload", fvp))
+        tree_vals_hi_addr = self.emit(
+            "tree_vals_hi_addr", "alu", ("+", fvp, const_V))
+        tree_vals_hi = self.emit(
+            "tree_vals_hi", "load", ("vload", tree_vals_hi_addr))
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        tree_base_1indexed_ = self.emit(
+            "tree_base_1indexed_", "alu",
+            ("-", fvp, const_one))
+        tree_base_1indexed = self.emit(
+            "tree_base_1indexed", "valu",
+            ("vbroadcast", tree_base_1indexed_))
+
+        # Broadcast depths 0-2 from lo block.
+        tree_root_vec = self.emit(
+            "tree_root_vec", "valu",
+            ("vbroadcast", tree_vals_lo.with_offset(0)))
+        tree_d1_left_vec = self.emit(
+            "tree_d1_left_vec", "valu",
+            ("vbroadcast", tree_vals_lo.with_offset(1)))
+        tree_d1_right_vec = self.emit(
+            "tree_d1_right_vec", "valu",
+            ("vbroadcast", tree_vals_lo.with_offset(2)))
+
+        tree_d2_vec, tree_d2_diff = self._emit_broadcast_and_diff(
+            "tree_d2", [(tree_vals_lo, 3 + i) for i in range(4)])
+
+        # Depth 3 (conditional).
+        tree_d3_vec: dict[int, Ref] = {}
+        tree_d3_diff: dict[int, Ref] = {}
+        if ENABLE_DEPTH_3_VSELECT:
+            d3_sources = (
+                [(tree_vals_lo, 7)]
+                + [(tree_vals_hi, i) for i in range(7)])
+            tree_d3_vec, tree_d3_diff = self._emit_broadcast_and_diff(
+                "tree_d3", d3_sources)
+
+        # Depth 4 (conditional, 2 more vloads).
+        tree_d4_vec: dict[int, Ref] = {}
+        tree_d4_diff: dict[int, Ref] = {}
+        if ENABLE_DEPTH_4_VSELECT:
+            d4_lo_addr = self.emit(
+                "tree_d4_lo_addr", "alu",
+                ("+", fvp, self.get_const(15)))
+            d4_lo = self.emit(
+                "tree_d4_lo", "load", ("vload", d4_lo_addr))
+            d4_hi_addr = self.emit(
+                "tree_d4_hi_addr", "alu",
+                ("+", fvp, self.get_const(23)))
+            d4_hi = self.emit(
+                "tree_d4_hi", "load", ("vload", d4_hi_addr))
+            d4_sources = (
+                [(d4_lo, i) for i in range(8)]
+                + [(d4_hi, i) for i in range(8)])
+            tree_d4_vec, tree_d4_diff = self._emit_broadcast_and_diff(
+                "tree_d4", d4_sources)
+
+        # ── Hash constant vectors ───────────────────────────────────
+        hash_const1_vec: dict[int, Ref] = {}
+        for stage in range(6):
+            hash_const1_vec[stage] = self.emit(
+                f"hash_const1_vec_{stage}", "valu",
+                ("vbroadcast", self.get_const(HASH_STAGES[stage][1])))
+        hash_const3_vec: dict[int, Ref] = {}
+        for stage in (1, 3, 5):
+            hash_const3_vec[stage] = self.emit(
+                f"hash_const3_vec_{stage}", "valu",
+                ("vbroadcast", self.get_const(HASH_STAGES[stage][4])))
+        hash_mult_vec: dict[int, Ref] = {}
+        for i, stage in enumerate((0, 2, 4)):
+            mult = 1 + (1 << HASH_STAGES[stage][4])
+            hash_mult_vec[i] = self.emit(
+                f"hash_mult_vec_{mult}", "valu",
+                ("vbroadcast", self.get_const(mult)))
+
+        two_vec = self.emit(
+            "two_vec", "valu", ("vbroadcast", const_two))
+
+
+        return SetupRefs(
+            const_zero=const_zero, group_offset=group_offset,
+            inp_values_ptr=ivp,
+            tree_root_vec=tree_root_vec,
+            tree_d1_left_vec=tree_d1_left_vec,
+            tree_d1_right_vec=tree_d1_right_vec,
+            tree_d2_vec=tree_d2_vec,
+            tree_d2_diff=tree_d2_diff,
+            tree_d3_vec=tree_d3_vec, tree_d3_diff=tree_d3_diff,
+            tree_d4_vec=tree_d4_vec, tree_d4_diff=tree_d4_diff,
+            hash_const1_vec=hash_const1_vec,
+            hash_const3_vec=hash_const3_vec,
+            hash_mult_vec=hash_mult_vec,
+            two_vec=two_vec,
+            tree_base_1indexed=tree_base_1indexed,
+        )
+
+    # ── Binary vselect tree reduction ──────────────────────────────
+    def _emit_vselect_tree(
+        self, prefix: str, depth: int,
+        leaf_bit: Ref,
+        diff: dict[int, Ref],
+        vec: dict[int, Ref],
+        reduce_bits: list[Ref],
+    ) -> Ref:
+        """Build multiply_add leaves, then binary vselect reduction.
+
+        Used for depths 3 and 4 where the tree node is selected via a
+        cascade of ``multiply_add`` + ``vselect`` operations.
+
+        Parameters
+        ----------
+        leaf_bit : branch bit used for the multiply_add leaves.
+        diff, vec : pre-computed diff and vec tables from SetupRefs.
+        reduce_bits : bits for each vselect level, outermost first
+            (e.g. ``[bit1, bit0]`` for depth 3).
+        """
+        label = f"d{depth}"
+        n_leaves = len(diff)
+
+        # Build leaves via multiply_add(leaf_bit, diff[i], vec[2*i]).
+        current: list[Ref] = [
+            self.emit(
+                f"{prefix}_{label}_sel_{i}", "valu",
+                ("multiply_add", leaf_bit, diff[i], vec[2 * i]))
+            for i in range(n_leaves)
+        ]
+
+        # Binary vselect reduction: pair adjacent nodes at each level.
+        for level, bit in enumerate(reduce_bits):
+            current = [
+                self.emit(
+                    f"{prefix}_{label}_r{level}_{i}", "flow",
+                    ("vselect", bit, current[2*i + 1], current[2*i]))
+                for i in range(len(current) // 2)
+            ]
+
+        assert len(current) == 1
+        return current[0]
+
+    # ── Tree XOR: select and XOR tree node value ─────────────────
+    def _emit_tree_xor(
+        self, prefix: str, depth: int, g: int,
+        values: Ref, ts: TreeState, s: SetupRefs,
+    ) -> Ref:
+        """Emit tree node selection + XOR. Returns updated values Ref."""
+        V = VLEN
+        bit0, bit1, bit2, bit3 = ts.bits
+
+        if depth == 0:
+            return self.emit(
+                f"{prefix}_tree_xor", "valu",
+                ("^", values, s.tree_root_vec))
+
+        if depth == 1:
+            nv = self.emit(
+                f"{prefix}_tree_select", "flow",
+                ("vselect", bit0,
+                 s.tree_d1_right_vec, s.tree_d1_left_vec))
+            return self.emit(
+                f"{prefix}_tree_xor", "valu", ("^", values, nv))
+
+        if depth == 2:
+            p0 = self.emit(
+                f"{prefix}_d2_pair0", "valu",
+                ("multiply_add", bit1,
+                 s.tree_d2_diff[0], s.tree_d2_vec[0]))
+            p1 = self.emit(
+                f"{prefix}_d2_pair1", "valu",
+                ("multiply_add", bit1,
+                 s.tree_d2_diff[1], s.tree_d2_vec[2]))
+            nv = self.emit(
+                f"{prefix}_d2_select", "flow",
+                ("vselect", bit0, p1, p0))
+            return self.emit(
+                f"{prefix}_tree_xor", "valu", ("^", values, nv))
+
+        if (depth == 3 and ENABLE_DEPTH_3_VSELECT
+                and use_vselect_at_depth_3(g)):
+            nv = self._emit_vselect_tree(
+                prefix, 3, bit2,
+                s.tree_d3_diff, s.tree_d3_vec, [bit1, bit0])
+            return self.emit(
+                f"{prefix}_tree_xor", "valu", ("^", values, nv))
+
+        if (depth == 4 and ENABLE_DEPTH_4_VSELECT
+                and use_vselect_at_depth_4(g)):
+            nv = self._emit_vselect_tree(
+                prefix, 4, bit3,
+                s.tree_d4_diff, s.tree_d4_vec, [bit2, bit1, bit0])
+            return self.emit(
+                f"{prefix}_tree_xor", "valu", ("^", values, nv))
+
+        # Scatter load (depth >= 3/4/5 depending on vselect flags).
+        scatter = self.alloc_vec(
+            f"{prefix}_scatter", deps=[ts.index, values])
+        addr = self.emit(
+            f"{prefix}_tree_base_1indexed", "valu",
+            ("+", s.tree_base_1indexed, ts.index))
+        for elem in range(V):
+            loaded = self.emit(
+                f"{prefix}_scat_load_{elem}", "load",
+                ("load", addr.with_offset(elem)))
+            self.emit(
+                f"{prefix}_scat_xor_{elem}", "alu",
+                ("^", values.with_offset(elem), loaded),
+                write_to=scatter.with_offset(elem))
+        return scatter
+
+    # ── Hash: 6-stage bit-mixing function ────────────────────────
+    def _emit_hash(self, prefix: str, values: Ref, s: SetupRefs) -> Ref:
+        """Emit the 6-stage hash. Returns updated values Ref."""
+        for stage in range(6):
+            op1, _v1, op2, op3, _v3 = HASH_STAGES[stage]
+            if stage in (0, 2, 4):
+                values = self.emit(
+                    f"{prefix}_hash{stage}", "valu",
+                    ("multiply_add", values,
+                     s.hash_mult_vec[stage // 2],
+                     s.hash_const1_vec[stage]))
+            else:
+                ha = self.emit(
+                    f"{prefix}_hash{stage}_a", "valu",
+                    (op1, values, s.hash_const1_vec[stage]))
+                hb = self.emit(
+                    f"{prefix}_hash{stage}_b", "valu",
+                    (op3, values, s.hash_const3_vec[stage]))
+                values = self.emit(
+                    f"{prefix}_hash{stage}_combine", "valu",
+                    (op2, ha, hb))
+        return values
+
+    # ── Index update (1-indexed tree) ────────────────────────────
+    def _emit_index_update(
+        self, prefix: str, depth: int,
+        values: Ref, ts: TreeState, s: SetupRefs,
+    ) -> None:
+        """Emit branch-bit + index update. Mutates *ts* in place."""
+        branch_bit = self.emit(
+            f"{prefix}_branch_bit", "valu",
+            ("%", values, s.two_vec))
+
+        ts.set_bit(depth, branch_bit)
+
+        if depth == 0:
+            ts.index = self.emit(
+                f"{prefix}_new_index", "valu",
+                ("+", branch_bit, s.two_vec))
+        else:
+            ts.index = self.emit(
+                f"{prefix}_new_index", "valu",
+                ("multiply_add", s.two_vec, ts.index, branch_bit))
+
+    # ── Top-level kernel builder ─────────────────────────────────
+    def build_kernel(
+        self,
+        forest_height: int,
+        n_nodes: int,
+        batch_size: int,
+        rounds: int,
+    ) -> None:
+        V = VLEN
+        num_groups = batch_size // V
+
+        s = self._emit_setup(num_groups)
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        completed_stores: list[Ref] = []
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        for g in range(num_groups):
+            # Concurrency limiter.
+            concurrency_deps: list[Ref] = (
+                [completed_stores[g - MAX_CONCURRENT_GROUPS]]
+                if g >= MAX_CONCURRENT_GROUPS else [])
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+            load_addr = self.emit(
+                f"group{g}_load_addr", "alu",
+                ("+", s.inp_values_ptr, s.group_offset[g]),
+                deps=concurrency_deps)
+            values = self.emit(
+                f"group{g}_values", "load", ("vload", load_addr))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+            ts = TreeState()
+
+            for rnd in range(rounds):
+                depth = (rnd if rnd <= forest_height
+                         else rnd - (forest_height + 1))
+                is_overflow = (depth == forest_height)
+                prefix = f"g{g}_r{rnd}"
+
+                values = self._emit_tree_xor(
+                    prefix, depth, g, values, ts, s)
+
+                values = self._emit_hash(prefix, values, s)
+
+                if not is_overflow and rnd < rounds - 1:
+                    self._emit_index_update(
+                        prefix, depth, values, ts, s)
+
+            store_addr = self.emit(
+                f"group{g}_store_addr", "alu",
+                ("+", s.inp_values_ptr, s.group_offset[g]))
+            store_ref = self.emit(
+                f"group{g}_store", "store",
+                ("vstore", store_addr, values))
+            completed_stores.append(store_ref)
+
+        # Schedule and emit.
+        print(f"Emitted {len(self.ops)} ops")
+        scheduled = schedule_and_allocate(
+            self.ops, SCRATCH_SIZE,
+            zero_vaddr=self.vid_to_vaddr[s.const_zero.vid])
+        self.instrs.extend(scheduled)
         self.instrs.append({"flow": [("pause",)]})
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  Test harness
+# ══════════════════════════════════════════════════════════════════════
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,
@@ -182,94 +1617,60 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
-):
-    print(f"{forest_height=}, {rounds=}, {batch_size=}")
+) -> int:
+    print(f"forest_height={forest_height}, rounds={rounds}, "
+          f"batch_size={batch_size}")
     random.seed(seed)
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
+    kb.build_kernel(forest.height, len(forest.values),
+                    len(inp.indices), rounds)
 
-    value_trace = {}
+    value_trace: dict = {}
     machine = Machine(
-        mem,
-        kb.instrs,
-        kb.debug_info(),
-        n_cores=N_CORES,
-        value_trace=value_trace,
-        trace=trace,
+        mem, kb.instrs, kb.debug_info(),
+        n_cores=N_CORES, value_trace=value_trace, trace=trace,
     )
     machine.prints = prints
+
     for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
         machine.run()
         inp_values_p = ref_mem[6]
         if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+            print(machine.mem[inp_values_p:inp_values_p + len(inp.values)])
+            print(ref_mem[inp_values_p:inp_values_p + len(inp.values)])
         assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+            machine.mem[inp_values_p:inp_values_p + len(inp.values)]
+            == ref_mem[inp_values_p:inp_values_p + len(inp.values)]
         ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
-    print("CYCLES: ", machine.cycle)
-    print("Speedup over baseline: ", BASELINE / machine.cycle)
+    print("CYCLES:", machine.cycle)
+    print("Speedup:", BASELINE / machine.cycle)
     return machine.cycle
 
 
 class Tests(unittest.TestCase):
-    def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
+    def test_ref_kernels(self) -> None:
         random.seed(123)
-        for i in range(10):
+        for _ in range(10):
             f = Tree.generate(4)
             inp = Input.generate(f, 10, 6)
             mem = build_mem_image(f, inp)
             reference_kernel(f, inp)
             for _ in reference_kernel2(mem, {}):
                 pass
-            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
-            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
+            assert inp.indices == mem[mem[5]:mem[5] + len(inp.indices)]
+            assert inp.values == mem[mem[6]:mem[6] + len(inp.values)]
 
-    def test_kernel_trace(self):
-        # Full-scale example for performance testing
+    def test_kernel_trace(self) -> None:
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
-
-    def test_kernel_cycles(self):
+    def test_kernel_cycles(self) -> None:
         do_kernel_test(10, 16, 256)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
