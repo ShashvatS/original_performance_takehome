@@ -1246,6 +1246,10 @@ class KernelBuilder:
         reduce_bits: list[Ref],
     ) -> Ref:
         """Build multiply_add leaves, then binary vselect reduction."""
+        # This tree is currently in the wrong order.
+        # Really, we should use vselect using the latest bit, allowing us
+        # to compute the earlier stages of the tree using the known bits.
+        # For some reason, this takes longer even though it should be strictly better.
         label = f"d{depth}"
         n_leaves = len(diff)
 
