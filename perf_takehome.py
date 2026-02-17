@@ -64,8 +64,8 @@ BASELINE_CYCLES: int = 147734
 PRIORITY_RECOMPUTE_INTERVAL: int = 5
 
 # Engine costs for critical-path weighting
-ENGINE_COSTS = {"flow": 0.85, "load": 0.25}
-ENGINE_COST_FLOW_LATE = 1.25
+ENGINE_COSTS = {"flow": 0.50, "load": 0.25}
+ENGINE_COST_FLOW_LATE = 1.50
 LATE_SCHEDULE_THRESHOLD = 300
 
 # When True, proactively offload offloadable VALU ops (vbroadcast, simple
@@ -1278,13 +1278,22 @@ class KernelBuilder:
         """
         label = f"d{depth}"
         n_leaves = len(diff)
+        half = n_leaves // 2
 
+        # First half: multiply_add on VALU engine
         current: list[Ref] = [
             self.emit(
                 f"{prefix}_{label}_sel_{i}", "valu",
                 ("multiply_add", leaf_bit, diff[i], vec[2 * i]))
-            for i in range(n_leaves)
+            for i in range(half)
         ]
+        # Second half: vselect on flow engine
+        current.extend([
+            self.emit(
+                f"{prefix}_{label}_sel_{i}", "flow",
+                ("vselect", leaf_bit, vec[2 * i + 1], vec[2 * i]))
+            for i in range(half, n_leaves)
+        ])
 
         for level, bit in enumerate(reduce_bits):
             current = [
