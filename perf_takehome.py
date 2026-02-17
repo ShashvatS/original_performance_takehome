@@ -59,6 +59,7 @@ ENABLE_DEPTH_4_VSELECT: bool = True
 REVERSE_TREE_BIT_ORDER_DEPTH_2: bool = True
 REVERSE_TREE_BIT_ORDER_DEPTH_3: bool = False
 REVERSE_TREE_BIT_ORDER_DEPTH_4: bool = False
+USE_3_VSELECT_DEPTH_2_CUTOFF = 15
 MAX_CONCURRENT_GROUPS: int = 20
 BASELINE_CYCLES: int = 147734
 PRIORITY_RECOMPUTE_INTERVAL: int = 5
@@ -1218,6 +1219,12 @@ class KernelBuilder:
             d2_sources = _bit_reverse_permute(d2_sources, 2)
         tree_d2_vec, tree_d2_diff = self._emit_broadcast_and_diff(
             "tree_d2", d2_sources)
+        # Broadcast odd vectors for groups using the 3-vselect d2 path
+        for odd_i in (1, 3):
+            block, off = d2_sources[odd_i]
+            tree_d2_vec[odd_i] = self.emit(
+                f"tree_d2_vec_{odd_i}", "valu",
+                ("vbroadcast", block.with_offset(off)))
 
         tree_d3_vec: dict[int, Ref] = {}
         tree_d3_diff: dict[int, Ref] = {}
@@ -1351,13 +1358,27 @@ class KernelBuilder:
                 leaf_bit, reduce_bit = bit0, bit1
             else:
                 leaf_bit, reduce_bit = bit1, bit0
-            p0 = self.emit(
-                f"{prefix}_d2_pair0", "valu",
-                ("multiply_add", leaf_bit, s.tree_d2_diff[0], s.tree_d2_vec[0]))
-            p1 = self.emit(
-                f"{prefix}_d2_pair1", "valu",
-                ("multiply_add", leaf_bit, s.tree_d2_diff[1], s.tree_d2_vec[2]))
-            nv = self.emit(f"{prefix}_d2_select", "flow", ("vselect", reduce_bit, p1, p0))
+            if g >= USE_3_VSELECT_DEPTH_2_CUTOFF:
+                # 3 vselects on flow engine
+                sel0 = self.emit(
+                    f"{prefix}_d2_sel0", "flow",
+                    ("vselect", leaf_bit, s.tree_d2_vec[1], s.tree_d2_vec[0]))
+                sel1 = self.emit(
+                    f"{prefix}_d2_sel1", "flow",
+                    ("vselect", leaf_bit, s.tree_d2_vec[3], s.tree_d2_vec[2]))
+                nv = self.emit(
+                    f"{prefix}_d2_select", "flow",
+                    ("vselect", reduce_bit, sel1, sel0))
+            else:
+                p0 = self.emit(
+                    f"{prefix}_d2_pair0", "valu",
+                    ("multiply_add", leaf_bit, s.tree_d2_diff[0], s.tree_d2_vec[0]))
+                p1 = self.emit(
+                    f"{prefix}_d2_pair1", "valu",
+                    ("multiply_add", leaf_bit, s.tree_d2_diff[1], s.tree_d2_vec[2]))
+                nv = self.emit(
+                    f"{prefix}_d2_select", "flow",
+                    ("vselect", reduce_bit, p1, p0))
             return self.emit(f"{prefix}_tree_xor", "valu", ("^", values, nv))
 
         if depth == 3 and ENABLE_DEPTH_3_VSELECT and use_vselect_at_depth_3(g):
