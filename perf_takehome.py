@@ -825,26 +825,18 @@ class Scheduler:
                             continue
                         deferred.append((neg_pri, order, idx))
                         continue
-                    else:
-                        if engine == "valu":
-                            if self._try_split_alu_offload(
-                                    op, earliest[idx], cycle, bundle,
-                                    slot_counts, result, result_cycles):
-                                scheduled.append(idx)
-                                continue
-                        if (isinstance(op.slot, ConstSlot)
-                                and slot_counts.get("flow", 0) < SLOT_LIMITS["flow"]
-                                and self.zero_vaddr is not None):
-                            alloc.alloc_for_op(op)
-                            dest_r = alloc.vmap[op.slot.dest]
-                            zero_r = alloc.vmap[self.zero_vaddr]
-                            bundle.setdefault("flow", []).append(
-                                ("add_imm", dest_r, zero_r, op.slot.value))
-                            slot_counts["flow"] = slot_counts.get("flow", 0) + 1
-                            scheduled.append(idx)
-                            continue
-                        deferred.append((neg_pri, order, idx))
+                    elif (isinstance(op.slot, ConstSlot) 
+                          and slot_counts.get("flow", 0) < SLOT_LIMITS["flow"] and self.zero_vaddr is not None):
+                        alloc.alloc_for_op(op)
+                        dest_r = alloc.vmap[op.slot.dest]
+                        zero_r = alloc.vmap[self.zero_vaddr]
+                        bundle.setdefault("flow", []).append(
+                            ("add_imm", dest_r, zero_r, op.slot.value))
+                        slot_counts["flow"] = slot_counts.get("flow", 0) + 1
+                        scheduled.append(idx)
                         continue
+                    deferred.append((neg_pri, order, idx))
+                    continue
 
                 if (PROACTIVE_VALU_OFFLOAD
                         and engine == "valu"
