@@ -2,6 +2,7 @@ trace.json
 **/*.pyc
 .hypothesis
 .DS_Store
+traces/**/*.json
 
 **/*.code-workspace
 .claude
