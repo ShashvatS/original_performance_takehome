@@ -1133,18 +1133,37 @@ class KernelBuilder:
 
     def _emit_broadcast_and_diff(
         self, label: str, sources: list[tuple[Ref, int]],
+        n_diff_pairs: int | None = None,
     ) -> tuple[dict[int, Ref], dict[int, Ref]]:
-        """Broadcast values from (block, offset) pairs, compute pairwise diffs."""
+        """Broadcast values and compute pairwise diffs as needed.
+
+        For the first *n_diff_pairs* pairs: compute scalar diff via ALU,
+        broadcast the diff and the base (even) vector only.
+        For remaining pairs: broadcast both even and odd vectors directly.
+        """
+        n_pairs = len(sources) // 2
+        if n_diff_pairs is None:
+            n_diff_pairs = n_pairs
         vec: dict[int, Ref] = {}
-        for i, (block, offset) in enumerate(sources):
-            vec[i] = self.emit(
-                f"{label}_vec_{i}", "valu",
-                ("vbroadcast", block.with_offset(offset)))
         diff: dict[int, Ref] = {}
-        for i in range(len(sources) // 2):
-            diff[i] = self.emit(
-                f"{label}_diff_{i}", "valu",
-                ("-", vec[2*i + 1], vec[2*i]))
+        for i in range(n_pairs):
+            base_block, base_off = sources[2 * i]
+            other_block, other_off = sources[2 * i + 1]
+            vec[2 * i] = self.emit(
+                f"{label}_vec_{2 * i}", "valu",
+                ("vbroadcast", base_block.with_offset(base_off)))
+            if i < n_diff_pairs:
+                scalar_diff = self.emit(
+                    f"{label}_sdiff_{i}", "alu",
+                    ("-", other_block.with_offset(other_off),
+                     base_block.with_offset(base_off)))
+                diff[i] = self.emit(
+                    f"{label}_diff_{i}", "valu",
+                    ("vbroadcast", scalar_diff))
+            else:
+                vec[2 * i + 1] = self.emit(
+                    f"{label}_vec_{2 * i + 1}", "valu",
+                    ("vbroadcast", other_block.with_offset(other_off)))
         return vec, diff
 
     def _emit_setup(self, num_groups: int) -> SetupRefs:
@@ -1208,7 +1227,8 @@ class KernelBuilder:
                 + [(tree_vals_hi, i) for i in range(7)])
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 d3_sources = _bit_reverse_permute(d3_sources, 3)
-            tree_d3_vec, tree_d3_diff = self._emit_broadcast_and_diff("tree_d3", d3_sources)
+            tree_d3_vec, tree_d3_diff = self._emit_broadcast_and_diff(
+                "tree_d3", d3_sources, n_diff_pairs=2)
 
         tree_d4_vec: dict[int, Ref] = {}
         tree_d4_diff: dict[int, Ref] = {}
@@ -1224,7 +1244,8 @@ class KernelBuilder:
                 + [(d4_hi, i) for i in range(8)])
             if REVERSE_TREE_BIT_ORDER_DEPTH_4:
                 d4_sources = _bit_reverse_permute(d4_sources, 4)
-            tree_d4_vec, tree_d4_diff = self._emit_broadcast_and_diff("tree_d4", d4_sources)
+            tree_d4_vec, tree_d4_diff = self._emit_broadcast_and_diff(
+                "tree_d4", d4_sources, n_diff_pairs=4)
 
         hash_const1_vec: dict[int, Ref] = {}
         for stage in range(6):
@@ -1277,22 +1298,22 @@ class KernelBuilder:
         bit-reversal permutation of the source vectors in _emit_setup.
         """
         label = f"d{depth}"
-        n_leaves = len(diff)
-        half = n_leaves // 2
+        n_leaves = 1 << (depth - 1)
+        n_diff = len(diff)
 
-        # First half: multiply_add on VALU engine
+        # First n_diff leaves: multiply_add on VALU engine
         current: list[Ref] = [
             self.emit(
                 f"{prefix}_{label}_sel_{i}", "valu",
                 ("multiply_add", leaf_bit, diff[i], vec[2 * i]))
-            for i in range(half)
+            for i in range(n_diff)
         ]
-        # Second half: vselect on flow engine
+        # Remaining leaves: vselect on flow engine
         current.extend([
             self.emit(
                 f"{prefix}_{label}_sel_{i}", "flow",
                 ("vselect", leaf_bit, vec[2 * i + 1], vec[2 * i]))
-            for i in range(half, n_leaves)
+            for i in range(n_diff, n_leaves)
         ])
 
         for level, bit in enumerate(reduce_bits):
