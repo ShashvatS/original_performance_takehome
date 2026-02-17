@@ -1228,7 +1228,7 @@ class KernelBuilder:
             if REVERSE_TREE_BIT_ORDER_DEPTH_3:
                 d3_sources = _bit_reverse_permute(d3_sources, 3)
             tree_d3_vec, tree_d3_diff = self._emit_broadcast_and_diff(
-                "tree_d3", d3_sources, n_diff_pairs=2)
+                "tree_d3", d3_sources, n_diff_pairs=1)
 
         tree_d4_vec: dict[int, Ref] = {}
         tree_d4_diff: dict[int, Ref] = {}
