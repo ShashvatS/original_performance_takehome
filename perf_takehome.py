@@ -930,6 +930,9 @@ class SetupRefs:
     hash_const1_vec: dict[int, Ref]
     hash_const3_vec: dict[int, Ref]
     hash_mult_vec: dict[int, Ref]
+    fused_23_const_ha: Ref
+    fused_23_mult_hb: Ref
+    fused_23_const_hb: Ref
     two_vec: Ref
     tree_base_1indexed: Ref
 
@@ -1271,6 +1274,21 @@ class KernelBuilder:
                 f"hash_mult_vec_{mult}", "valu",
                 ("vbroadcast", self.get_const(mult)))
 
+        # Fused stages 2-3 constants:
+        # Stage 2: b = 33*a + C2; Stage 3: (b+C3) ^ (b<<9)
+        # = (33*a + C2+C3) ^ (16896*a + C2<<9)
+        C2 = HASH_STAGES[2][1]
+        C3 = HASH_STAGES[3][1]
+        fused_23_const_ha = self.emit(
+            "fused_23_const_ha", "valu",
+            ("vbroadcast", self.get_const((C2 + C3) & 0xFFFFFFFF)))
+        fused_23_mult_hb = self.emit(
+            "fused_23_mult_hb", "valu",
+            ("vbroadcast", self.get_const(33 * 512)))
+        fused_23_const_hb = self.emit(
+            "fused_23_const_hb", "valu",
+            ("vbroadcast", self.get_const((C2 << 9) & 0xFFFFFFFF)))
+
         two_vec = self.emit("two_vec", "valu", ("vbroadcast", const_two))
 
         return SetupRefs(
@@ -1286,6 +1304,9 @@ class KernelBuilder:
             hash_const1_vec=hash_const1_vec,
             hash_const3_vec=hash_const3_vec,
             hash_mult_vec=hash_mult_vec,
+            fused_23_const_ha=fused_23_const_ha,
+            fused_23_mult_hb=fused_23_mult_hb,
+            fused_23_const_hb=fused_23_const_hb,
             two_vec=two_vec,
             tree_base_1indexed=tree_base_1indexed,
         )
@@ -1417,7 +1438,24 @@ class KernelBuilder:
         """Emit the 6-stage hash. Returns updated values Ref."""
         for stage in range(6):
             op1, _v1, op2, op3, _v3 = HASH_STAGES[stage]
-            if stage in (0, 2, 4):
+            if stage == 2:
+                # Fuse stages 2-3: saves 1 VALU
+                # Stage 2: b = 33*a + C2; Stage 3: (b+C3) ^ (b<<9)
+                # = (33*a + C2+C3) ^ (16896*a + C2<<9)
+                ha = self.emit(
+                    f"{prefix}_hash23_a", "valu",
+                    ("multiply_add", values,
+                     s.hash_mult_vec[1], s.fused_23_const_ha))
+                hb = self.emit(
+                    f"{prefix}_hash23_b", "valu",
+                    ("multiply_add", values,
+                     s.fused_23_mult_hb, s.fused_23_const_hb))
+                values = self.emit(
+                    f"{prefix}_hash23_combine", "valu",
+                    ("^", ha, hb))
+            elif stage == 3:
+                continue  # handled in stage 2
+            elif stage in (0, 4):
                 values = self.emit(
                     f"{prefix}_hash{stage}", "valu",
                     ("multiply_add", values,
