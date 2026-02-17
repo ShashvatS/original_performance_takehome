@@ -64,7 +64,7 @@ BASELINE_CYCLES: int = 147734
 PRIORITY_RECOMPUTE_INTERVAL: int = 5
 
 # Engine costs for critical-path weighting
-ENGINE_COSTS = {"flow": 0.50, "load": 0.25}
+ENGINE_COSTS = {"flow": 0.30, "load": 0.25}
 ENGINE_COST_FLOW_LATE = 1.50
 LATE_SCHEDULE_THRESHOLD = 300
 
