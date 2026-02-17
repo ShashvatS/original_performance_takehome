@@ -68,6 +68,12 @@ ENGINE_COSTS = {"flow": 0.85, "load": 0.25}
 ENGINE_COST_FLOW_LATE = 1.25
 LATE_SCHEDULE_THRESHOLD = 300
 
+# When True, proactively offload offloadable VALU ops (vbroadcast, simple
+# binary ops) to ALU even when VALU has room, preserving VALU for
+# non-offloadable ops like multiply_add. When False, prefer VALU when it
+# has room and only offload to ALU when VALU is full.
+PROACTIVE_VALU_OFFLOAD: bool = True
+
 # Priority calculation scales
 CRITICAL_PATH_SCALE = 100.0
 # Cross engine bonus currently has no impact.
@@ -633,26 +639,6 @@ class Scheduler:
             case _:
                 raise ValueError(f"Cannot make ALU ops from {real_slot}")
 
-    def _try_evict_valu_to_alu(
-        self,
-        bundle: dict[str, list[tuple]],
-        slot_counts: dict[str, int],
-        valu_this_cycle: list[tuple[Op, Slot]],
-    ) -> bool:
-        """Evict one offloadable VALU op to ALU to free a VALU slot."""
-        if slot_counts.get("alu", 0) + self.V > SLOT_LIMITS["alu"]:
-            return False
-        for i, (evict_op, evict_real_slot) in enumerate(valu_this_cycle):
-            if self._is_alu_offloadable(evict_op):
-                evict_tuple = slot_to_tuple(evict_real_slot)
-                bundle["valu"].remove(evict_tuple)
-                slot_counts["valu"] -= 1
-                valu_this_cycle.pop(i)
-                all_alu = self._make_alu_ops(evict_real_slot)
-                bundle.setdefault("alu", []).extend(all_alu)
-                slot_counts["alu"] = slot_counts.get("alu", 0) + self.V
-                return True
-        return False
 
     @staticmethod
     def _collect_bundle_addrs(bundles: list[dict]) -> set[int]:
@@ -831,14 +817,19 @@ class Scheduler:
                     continue
 
                 if slot_counts[engine] >= SLOT_LIMITS.get(engine, 0):
-                    if engine == "valu" and self._try_evict_valu_to_alu(
-                            bundle, slot_counts, valu_this_cycle):
-                        pass
+                    if engine == "valu" and self._is_alu_offloadable(op):
+                        if self._try_split_alu_offload(
+                                op, earliest[idx], cycle, bundle,
+                                slot_counts, result, result_cycles):
+                            scheduled.append(idx)
+                            continue
+                        deferred.append((neg_pri, order, idx))
+                        continue
                     else:
                         if engine == "valu":
                             if self._try_split_alu_offload(
-                                    op, earliest[idx], cycle, bundle, slot_counts,
-                                    result, result_cycles):
+                                    op, earliest[idx], cycle, bundle,
+                                    slot_counts, result, result_cycles):
                                 scheduled.append(idx)
                                 continue
                         if (isinstance(op.slot, ConstSlot)
@@ -853,6 +844,15 @@ class Scheduler:
                             scheduled.append(idx)
                             continue
                         deferred.append((neg_pri, order, idx))
+                        continue
+
+                if (PROACTIVE_VALU_OFFLOAD
+                        and engine == "valu"
+                        and self._is_alu_offloadable(op)):
+                    if self._try_split_alu_offload(
+                            op, earliest[idx], cycle, bundle,
+                            slot_counts, result, result_cycles):
+                        scheduled.append(idx)
                         continue
 
                 alloc.alloc_for_op(op)
